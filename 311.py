@@ -1,227 +1,121 @@
-# streamlit_311.py
-import datetime as dt
-from urllib.parse import urlencode
-
-import numpy as np
+# 311calls.py
 import pandas as pd
+import numpy as np
 import plotly.express as px
 import streamlit as st
 
-st.set_page_config(
-    page_title="NYC 311 — What do New Yorkers complain about?",
-    page_icon="🗽",
-    layout="wide",
-)
+st.set_page_config(page_title="NYC 311 – Where are the complaints?", page_icon="📞", layout="wide")
 
-# ---------- Helpers ----------
-DATASET = "https://data.cityofnewyork.us/resource/erm2-nwe9.json"
+@st.cache_data(show_spinner=True)
+def load_311(limit=50000, year_from=2023):
+    # Pull a light subset for speed
+    url = (
+        "https://data.cityofnewyork.us/resource/erm2-nwe9.csv"
+        f"?$select=created_date,closed_date,agency,complaint_type,descriptor,"
+        f"borough,latitude,longitude"
+        f"&$where=created_date >= '{year_from}-01-01T00:00:00.000' AND latitude IS NOT NULL"
+        f"&$limit={limit}"
+    )
+    df = pd.read_csv(url, low_memory=False)
 
-COLUMNS = [
-    "created_date",
-    "closed_date",
-    "complaint_type",
-    "descriptor",
-    "agency",
-    "status",
-    "borough",
-    "incident_zip",
-    "latitude",
-    "longitude",
-]
-
-def socrata_url(start: dt.datetime, end: dt.datetime, limit: int, boroughs: list[str]):
-    where = [
-        f"created_date between '{start.isoformat()}T00:00:00' and '{end.isoformat()}T23:59:59'",
-        "latitude is not null",
-        "longitude is not null",
-    ]
-    if boroughs:
-        b = ", ".join([f"'{x}'" for x in boroughs])
-        where.append(f"borough in ({b})")
-
-    params = {
-        "$select": ",".join(COLUMNS),
-        "$where": " AND ".join(where),
-        "$order": "created_date DESC",
-        "$limit": limit,
-    }
-    return DATASET + "?" + urlencode(params)
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_311(start_date: dt.date, end_date: dt.date, limit: int, boroughs: list[str]):
-    url = socrata_url(start_date, end_date, limit, boroughs)
-    df = pd.read_json(url, dtype_backend="pyarrow")  # fast + light
-    if df.empty:  # guard
-        return df
-    # tidy types
+    # Basic cleaning
     df["created_date"] = pd.to_datetime(df["created_date"], errors="coerce")
     df["closed_date"] = pd.to_datetime(df["closed_date"], errors="coerce")
-    df["response_hours"] = (
-        (df["closed_date"] - df["created_date"]).dt.total_seconds() / 3600
-    )
-    df["day"] = df["created_date"].dt.date
-    df["borough"] = df["borough"].fillna("Unknown")
-    df["complaint_type"] = df["complaint_type"].fillna("Unknown")
+
+    # Coerce lat/lon to numeric and drop invalids
+    for c in ("latitude", "longitude"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["latitude", "longitude"])
+
+    # NYC bounding box (screens out weird points)
+    df = df.query("40.3 < latitude < 41.2 and -75 < longitude < -73.3")
+
+    # Light derived features
+    df["date"] = df["created_date"].dt.date
+    df["month"] = df["created_date"].dt.to_period("M").dt.to_timestamp()
+
     return df
 
-# ---------- Sidebar controls ----------
-st.sidebar.title("Filters")
-today = dt.date.today()
-default_start = today - dt.timedelta(days=60)
+st.title("📞 Where are the complaints? (sampled for performance)")
 
-start_date = st.sidebar.date_input("Start date", default_start, max_value=today)
-end_date = st.sidebar.date_input("End date", today, min_value=start_date, max_value=today)
+# Sidebar controls
+with st.sidebar:
+    st.markdown("### Data options")
+    year_from = st.number_input("Start year", min_value=2016, max_value=2025, value=2023, step=1)
+    limit = st.slider("Rows to load", 10_000, 200_000, 50_000, 10_000)
+    st.caption("Tip: increase for more detail, decrease for speed.")
+    st.markdown("---")
+    st.markdown("### Map options")
+    color_by = st.selectbox("Color complaints by", ["complaint_type", "borough"])
+    sample_for_map = st.slider("Map sample points", 2_000, 30_000, 10_000, 2_000)
+    radius = st.slider("Heatmap radius", 4, 30, 10, 1)
 
-limit = st.sidebar.slider("Rows to fetch (kept small for speed)", 5_000, 30_000, 15_000, step=5_000)
+df = load_311(limit=limit, year_from=year_from)
 
-# borough options (static list avoids an extra call)
-BORO_OPTS = ["BRONX", "BROOKLYN", "MANHATTAN", "QUEENS", "STATEN ISLAND"]
-boroughs = st.sidebar.multiselect("Boroughs", BORO_OPTS, default=[])
-
-st.sidebar.caption("Tip: keep the date window modest and rows ≤30k for snappy maps.")
-
-# ---------- Load data ----------
-with st.spinner("Loading 311 data from NYC Open Data…"):
-    df = fetch_311(start_date, end_date, limit, boroughs)
-
-st.title("🗽 NYC 311 Service Requests — What are people complaining about?")
-st.caption(
-    f"Window: **{start_date} → {end_date}** · Rows loaded: **{len(df):,}** "
-    "· Source: NYC Open Data “311 Service Requests” (erm2-nwe9)"
-)
-st.markdown("---")
-
-if df.empty:
-    st.warning("No rows returned. Try widening the date window or removing filters.")
-    st.stop()
-
-# ---------- KPIs ----------
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    st.metric("Total Requests", f"{len(df):,}")
-with c2:
-    pct_closed = (df["status"].astype(str).str.lower().eq("closed").mean() * 100)
-    st.metric("Closed (%)", f"{pct_closed:.1f}%")
-with c3:
-    med_hours = np.nanmedian(df["response_hours"])
-    med_txt = "—" if np.isnan(med_hours) else f"{med_hours:.1f} h"
-    st.metric("Median Response Time", med_txt)
-with c4:
-    top_type = df["complaint_type"].value_counts().idxmax()
-    st.metric("Top Complaint", top_type)
-
-st.markdown("")
-
-# ---------- Controls for visuals ----------
-left, right = st.columns([1, 3])
+# ====== 1) COMPLAINTS OVER TIME ======
+left, right = st.columns([2,1])
 with left:
-    topN = st.slider("Show Top N complaint types", 5, 20, 10)
+    by_month = df.groupby("month").size().reset_index(name="count")
+    fig_time = px.line(
+        by_month, x="month", y="count",
+        markers=True, title="Requests per month",
+        color_discrete_sequence=["#4C78A8"]
+    )
+    fig_time.update_layout(margin=dict(l=10, r=10, t=50, b=0))
+    st.plotly_chart(fig_time, width="stretch", height=360)
+
+# ====== 2) TOP COMPLAINT TYPES ======
 with right:
-    sort_by_time = st.toggle("Order top chart by median response time (instead of volume)", value=False)
+    top_n = (
+        df["complaint_type"].fillna("Unknown")
+        .value_counts().head(15).sort_values(ascending=True)
+        .rename_axis("complaint_type").reset_index(name="count")
+    )
+    fig_bar = px.bar(
+        top_n, x="count", y="complaint_type", orientation="h",
+        title="Top 15 complaint types",
+        color="count", color_continuous_scale="Sunset"
+    )
+    fig_bar.update_layout(coloraxis_showscale=False, margin=dict(l=10, r=10, t=50, b=0))
+    st.plotly_chart(fig_bar, width="stretch", height=360)
 
-# ---------- Top complaints (bar) ----------
-group = (
-    df.groupby("complaint_type")
-    .agg(count=("complaint_type", "size"), median_hours=("response_hours", "median"))
-    .reset_index()
-)
+# ====== 3) SCATTER MAP (fixed) ======
+st.markdown("### 📍 Points on map (sampled)")
 
-if sort_by_time:
-    group = group.sort_values("median_hours", ascending=True).head(topN)
-else:
-    group = group.sort_values("count", ascending=False).head(topN)
-
-bar_title = "Top Complaints — by Volume" if not sort_by_time else "Top Complaints — by Median Response Time"
-fig_bar = px.bar(
-    group,
-    x="complaint_type",
-    y="count" if not sort_by_time else "median_hours",
-    color="median_hours",
-    color_continuous_scale="Sunset",
-    labels={"complaint_type": "Complaint Type", "count": "Requests", "median_hours": "Median Hours"},
-    title=bar_title,
-)
-fig_bar.update_layout(xaxis_tickangle=-30, margin=dict(t=60, r=10, l=10, b=10))
-st.plotly_chart(fig_bar, width="stretch")
-
-# ---------- Trend over time ----------
-trend = (
-    df.groupby(["day", "complaint_type"])
-    .size()
-    .reset_index(name="count")
-    .sort_values("day")
-)
-
-fig_line = px.line(
-    trend,
-    x="day",
-    y="count",
-    color="complaint_type",
-    line_group="complaint_type",
-    markers=True,
-    color_discrete_sequence=px.colors.qualitative.Set2,
-    labels={"day": "Date", "count": "Requests"},
-    title="Requests per Day (colored by complaint type)",
-)
-fig_line.update_layout(legend_title_text="Complaint", margin=dict(t=60, r=10, l=10, b=10))
-st.plotly_chart(fig_line, width="stretch")
-
-# ---------- Map ----------
-st.subheader("Where are the complaints? (sampled for performance)")
-map_sample = df.dropna(subset=["latitude", "longitude"]).copy()
-if len(map_sample) > 10_000:
-    map_sample = map_sample.sample(10_000, random_state=42)
+# Sample for performance
+geo = df[["latitude", "longitude", "complaint_type", "borough", "created_date"]].copy()
+if len(geo) > sample_for_map:
+    geo = geo.sample(sample_for_map, random_state=42)
 
 fig_map = px.scatter_mapbox(
-    map_sample,
-    lat="latitude",
-    lon="longitude",
-    color="complaint_type",
-    hover_data={"created_date": True, "status": True, "borough": True, "incident_zip": True},
-    zoom=9,
-    height=600,
-    color_discrete_sequence=px.colors.qualitative.Set2,
-    title=f"Geography of Requests (showing {len(map_sample):,} points)",
+    geo,
+    lat="latitude", lon="longitude",
+    color=color_by,
+    hover_data={"latitude": ":.5f", "longitude": ":.5f", "created_date": True},
+    zoom=9, height=560,
+    title=f"Geography of Requests (showing {len(geo):,} points)",
 )
-fig_map.update_layout(mapbox_style="open-street-map", margin=dict(t=60, r=0, l=0, b=0))
+fig_map.update_layout(
+    mapbox_style="open-street-map",
+    margin=dict(l=0, r=0, t=60, b=0),
+    legend_title=color_by.replace("_", " ").title(),
+)
 st.plotly_chart(fig_map, width="stretch")
 
-# ---------- Borough splits ----------
-st.subheader("Borough Breakdown")
-boro = (
-    df.groupby("borough")
-    .agg(count=("complaint_type", "size"), median_hours=("response_hours", "median"))
-    .reset_index()
-    .sort_values("count", ascending=False)
-)
-cA, cB = st.columns(2)
-with cA:
-    fig_b1 = px.bar(
-        boro,
-        x="borough",
-        y="count",
-        color="count",
-        color_continuous_scale="OrRd",
-        title="Requests by Borough",
-        labels={"borough": "Borough", "count": "Requests"},
-    )
-    fig_b1.update_layout(margin=dict(t=50, r=10, l=10, b=10))
-    st.plotly_chart(fig_b1, width="stretch")
-with cB:
-    fig_b2 = px.bar(
-        boro.sort_values("median_hours", ascending=True),
-        x="borough",
-        y="median_hours",
-        color="median_hours",
-        color_continuous_scale="Sunset",
-        title="Median Response Time by Borough (hours)",
-        labels={"borough": "Borough", "median_hours": "Median Hours"},
-    )
-    fig_b2.update_layout(margin=dict(t=50, r=10, l=10, b=10))
-    st.plotly_chart(fig_b2, width="stretch")
+# ====== 4) DENSITY HEATMAP (smooth hotspot view) ======
+st.markdown("### 🔥 Density heatmap (hotspots)")
+geo_for_heat = df[["latitude", "longitude", "complaint_type"]]
+if len(geo_for_heat) > 20_000:
+    geo_for_heat = geo_for_heat.sample(20_000, random_state=42)
 
-st.markdown("---")
-st.caption(
-    "Built with Streamlit + Plotly using live data from NYC Open Data (dataset `erm2-nwe9`). "
-    "This app fetches only a limited window + row count to keep maps responsive."
+fig_heat = px.density_mapbox(
+    geo_for_heat,
+    lat="latitude", lon="longitude",
+    radius=radius,
+    center=dict(lat=40.7128, lon=-74.0060),
+    zoom=9, height=560,
+    title="Complaint hotspots (density map)",
+    color_continuous_scale="OrRd"
 )
+fig_heat.update_layout(mapbox_style="carto-positron", margin=dict(l=0, r=0, t=60, b=0))
+st.plotly_chart(fig_heat, width="stretch")
