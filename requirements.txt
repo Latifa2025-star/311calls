@@ -1,7 +1,6 @@
-streamlit>=1.38
-pandas>=2.2
-numpy>=1.26
-plotly>=5.24
-pydeck>=0.9
-sodapy>=2.2
-python-dateutil>=2.9
+streamlit
+pandas
+numpy
+requests
+plotly
+pydeck
