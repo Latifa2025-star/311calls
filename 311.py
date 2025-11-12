@@ -285,18 +285,30 @@ if rows_after and {"day_of_week","hour"}.issubset(df_f.columns):
 # --------------------------------
 # ANIMATED BAR (keep the warm colors) + narrative
 # --------------------------------
+# ANIMATED BAR (keep the warm colors) + narrative
+# --------------------------------
 st.subheader("▶️ How do complaints evolve through the day?")
 st.caption("Press **Play** to watch requests change by hour (top categories shown for clarity).")
 
-if rows_after and {"hour","complaint_type"}.issubset(df_f.columns):
-    # Focus animation on top 6 categories overall to keep it smooth
+if rows_after and {"hour", "complaint_type"}.issubset(df_f.columns):
+    # Ensure hours 0–23 always appear
+    hours_full = pd.DataFrame({"hour": range(24)})
+
+    # Focus animation on top 6 categories overall
     top6 = df_f["complaint_type"].value_counts().head(6).index
     df_anim = (
         df_f[df_f["complaint_type"].isin(top6)]
-        .groupby(["hour","complaint_type"])
+        .groupby(["hour", "complaint_type"])
         .size()
         .reset_index(name="Requests")
     )
+
+    # Merge to guarantee all 24 hours show (fill missing with 0)
+    df_anim = (
+        df_anim.merge(hours_full, on="hour", how="right")
+        .fillna({"Requests": 0})
+    )
+    df_anim["hour"] = df_anim["hour"].astype(int)
 
     fig_anim = px.bar(
         df_anim.sort_values("Requests"),
@@ -304,7 +316,7 @@ if rows_after and {"hour","complaint_type"}.issubset(df_f.columns):
         color="complaint_type",
         animation_frame="hour",
         orientation="h",
-        range_x=[0, max(1, int(df_anim["Requests"].max()*1.15))],
+        range_x=[0, max(1, int(df_anim["Requests"].max() * 1.15))],
         color_discrete_sequence=WARM,
         title="How requests evolve through the day (press ▶ to play)",
     )
@@ -317,13 +329,13 @@ if rows_after and {"hour","complaint_type"}.issubset(df_f.columns):
     )
     st.plotly_chart(fig_anim, use_container_width=True)
 
-    # Narrative
-    # Find hour with most total requests (within the shown top6 set)
+    # Narrative: find the peak hour among all 24
     by_hour = df_anim.groupby("hour")["Requests"].sum().sort_values(ascending=False)
     if len(by_hour):
         st.markdown(
             f"**Narrative:** Within the shown categories, peaks typically occur around **{int(by_hour.index[0])}:00**."
         )
+
 
 # --------------------------------
 # GEOGRAPHIC MAP with legend + tooltips/popups
@@ -411,6 +423,7 @@ else:
 
 st.markdown("---")
 st.caption("Tip: If the runner icon stays spinning for long, try narrowing filters or lowering chart item counts.")
+
 
 
 
