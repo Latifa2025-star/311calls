@@ -124,22 +124,47 @@ else:
     st.info("No complaints to display for selected filters.")
 
 # ===================
-# STATUS PIE CHART
 # ===================
-if "status" in df_f:
-    st.subheader("📈 Status Breakdown")
+# STATUS PIE CHART (robust against duplicate columns)
+# ===================
+st.subheader("📈 Status Breakdown")
+
+if "status" in df_f.columns and not df_f["status"].dropna().empty:
+    # Build a clean 2-col dataframe: ['status', 'count'] with guaranteed unique names
     status_counts = (
-        df_f["status"].value_counts().reset_index().rename(columns={"index": "status", "status": "count"})
-    ).drop_duplicates()
+        df_f.groupby("status", dropna=True)
+            .size()
+            .reset_index(name="count")
+    )
+    # Force uniqueness & order, just in case
+    status_counts = pd.DataFrame(status_counts)                # ensure pandas df
+    status_counts = status_counts.loc[:, ~status_counts.columns.duplicated()].copy()
+    status_counts.columns = ["status", "count"]
+    status_counts = status_counts.sort_values("count", ascending=False, kind="mergesort")
+
+    # Make the pie
     fig_pie = px.pie(
         status_counts,
         values="count",
         names="status",
-        hole=0.5,
+        hole=0.55,
         color_discrete_sequence=px.colors.qualitative.Set3,
+        title="Status Breakdown"
     )
-    fig_pie.update_traces(textinfo="label+percent", pull=[0.05]*len(status_counts))
+    fig_pie.update_traces(
+        textinfo="label+percent",
+        hovertemplate="<b>%{label}</b><br>Requests: %{value:,}<extra></extra>",
+        pull=[0.05] * len(status_counts)
+    )
+    fig_pie.update_layout(
+        legend_title_text="Status",
+        margin=dict(t=60, r=10, b=10, l=10),
+        title_font=dict(size=18)
+    )
     st.plotly_chart(fig_pie, use_container_width=True)
+else:
+    st.info("No status information available for the current filters.")
+
 
 # ===================
 # RESOLUTION TIME BY TYPE
@@ -250,3 +275,4 @@ else:
 
 st.markdown("---")
 st.caption("Tip: Use filters on the left to focus by day, hour, and borough. Charts update instantly on your compressed dataset.")
+
