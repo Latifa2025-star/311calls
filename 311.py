@@ -284,46 +284,23 @@ if rows_after and {"day_of_week","hour"}.issubset(df_f.columns):
 
 # --------------------------------
 # ANIMATED BAR (keep the warm colors) + narrative
-# --------------------------------
+# Animated complaints by hour
 st.subheader("▶️ How do complaints evolve through the day?")
-st.caption("Press **Play** to watch requests change by hour (top categories shown for clarity).")
+hourly = filtered.groupby(['hour', 'complaint_type']).size().reset_index(name='count')
+fig_anim = px.bar(
+    hourly,
+    x="count", y="complaint_type",
+    color="complaint_type",
+    animation_frame="hour",
+    range_x=[0, hourly['count'].max()],
+    title="How requests evolve through the day (press ▶ to play)",
+    color_discrete_sequence=px.colors.sequential.OrRd_r
+)
+fig_anim.update_layout(xaxis_title="Requests (count)", yaxis_title="Complaint Type")
+st.plotly_chart(fig_anim, use_container_width=True)
 
-if rows_after and {"hour","complaint_type"}.issubset(df_f.columns):
-    # Focus animation on top 6 categories overall to keep it smooth
-    top6 = df_f["complaint_type"].value_counts().head(6).index
-    df_anim = (
-        df_f[df_f["complaint_type"].isin(top6)]
-        .groupby(["hour","complaint_type"])
-        .size()
-        .reset_index(name="Requests")
-    )
-
-    fig_anim = px.bar(
-        df_anim.sort_values("Requests"),
-        x="Requests", y="complaint_type",
-        color="complaint_type",
-        animation_frame="hour",
-        orientation="h",
-        range_x=[0, max(1, int(df_anim["Requests"].max()*1.15))],
-        color_discrete_sequence=WARM,
-        title="How requests evolve through the day (press ▶ to play)",
-    )
-    fig_anim.update_layout(
-        yaxis_title="Complaint Type",
-        xaxis_title="Requests (count)",
-        title_font=dict(size=18),
-        showlegend=False,
-        updatemenus=[dict(type="buttons", showactive=False)],
-    )
-    st.plotly_chart(fig_anim, use_container_width=True)
-
-    # Narrative
-    # Find hour with most total requests (within the shown top6 set)
-    by_hour = df_anim.groupby("hour")["Requests"].sum().sort_values(ascending=False)
-    if len(by_hour):
-        st.markdown(
-            f"**Narrative:** Within the shown categories, peaks typically occur around **{int(by_hour.index[0])}:00**."
-        )
+peak_hour = hourly.groupby('hour')['count'].sum().idxmax()
+st.markdown(f"**Narrative:** Complaint peaks typically occur around **{peak_hour}:00** hours.")
 
 # --------------------------------
 # GEOGRAPHIC MAP with legend + tooltips/popups
@@ -411,3 +388,4 @@ else:
 
 st.markdown("---")
 st.caption("Tip: If the runner icon stays spinning for long, try narrowing filters or lowering chart item counts.")
+
