@@ -4,3 +4,5 @@ numpy
 requests
 plotly
 pydeck
+streamlit-folium==0.20.0
+folium==0.16.0
