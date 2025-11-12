@@ -285,13 +285,14 @@ if rows_after and {"day_of_week","hour"}.issubset(df_f.columns):
 # --------------------------------
 # ANIMATED BAR (keep the warm colors) + narrative
 # --------------------------------
+# --------------------------------
 # ANIMATED BAR (keep the warm colors) + narrative
 # --------------------------------
 st.subheader("▶️ How do complaints evolve through the day?")
 st.caption("Press **Play** to watch requests change by hour (top categories shown for clarity).")
 
 if rows_after and {"hour", "complaint_type"}.issubset(df_f.columns):
-    # Ensure hours 0–23 always appear
+    # Ensure 0–23 always appear, even if no data
     hours_full = pd.DataFrame({"hour": range(24)})
 
     # Focus animation on top 6 categories overall
@@ -303,21 +304,23 @@ if rows_after and {"hour", "complaint_type"}.issubset(df_f.columns):
         .reset_index(name="Requests")
     )
 
-    # Merge to guarantee all 24 hours show (fill missing with 0)
-    df_anim = (
-        df_anim.merge(hours_full, on="hour", how="right")
-        .fillna({"Requests": 0})
-    )
+    # Merge to include missing hours (fill with 0)
+    df_anim = hours_full.merge(df_anim, on="hour", how="left").fillna({"Requests": 0})
     df_anim["hour"] = df_anim["hour"].astype(int)
+    df_anim["complaint_type"].fillna("No Data", inplace=True)
+
+    # Sort hours properly (0–23)
+    df_anim = df_anim.sort_values("hour")
 
     fig_anim = px.bar(
-        df_anim.sort_values("Requests"),
+        df_anim,
         x="Requests", y="complaint_type",
         color="complaint_type",
         animation_frame="hour",
         orientation="h",
         range_x=[0, max(1, int(df_anim["Requests"].max() * 1.15))],
         color_discrete_sequence=WARM,
+        category_orders={"hour": list(range(24))},  # Force 0→23
         title="How requests evolve through the day (press ▶ to play)",
     )
     fig_anim.update_layout(
@@ -329,12 +332,13 @@ if rows_after and {"hour", "complaint_type"}.issubset(df_f.columns):
     )
     st.plotly_chart(fig_anim, use_container_width=True)
 
-    # Narrative: find the peak hour among all 24
+    # Narrative
     by_hour = df_anim.groupby("hour")["Requests"].sum().sort_values(ascending=False)
     if len(by_hour):
         st.markdown(
             f"**Narrative:** Within the shown categories, peaks typically occur around **{int(by_hour.index[0])}:00**."
         )
+
 
 
 # --------------------------------
@@ -423,6 +427,7 @@ else:
 
 st.markdown("---")
 st.caption("Tip: If the runner icon stays spinning for long, try narrowing filters or lowering chart item counts.")
+
 
 
 
