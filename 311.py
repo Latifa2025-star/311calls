@@ -1,441 +1,430 @@
-# 311.py — NYC 311 Service Requests Explorer (Streamlit)
-# ------------------------------------------------------
-# - Reads a compressed CSV (.csv.gz) shipped in the repo
-# - Provides interactive, polished visualizations with narratives
-# - Robust against empty filters / missing columns
+# 311.py
+# NYC 311 Service Requests Explorer — Streamlit app
+# - Loads a local compressed CSV (nyc311_12months.csv.gz) or CSV fallback
+# - Rich filters + KPIs
+# - Top types bar + status donut + resolution-time boxplot + day×hour heatmap (with clear "Number of requests" colorbar)
+# - Animation 1: bar race of top complaint types through the day (hour)
+# - Animation 2: bubble animation showing count vs median hours to close, by complaint type, over the day
+# - Fancy Map: clustered points + heat layer (Leaflet/Folium) with type & status in popup; colored by status
 
 from __future__ import annotations
 import os
-from typing import List, Tuple
-
 import numpy as np
 import pandas as pd
+import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
-import streamlit as st
+
+from streamlit_folium import st_folium
+import folium
+from folium.plugins import HeatMap, MarkerCluster
 
 # -----------------------------
-# Basic config
+# App config & theme
 # -----------------------------
 st.set_page_config(
     page_title="NYC 311 Service Requests Explorer",
     page_icon="📞",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-TITLE = "NYC 311 Service Requests Explorer"
-SUBTITLE = (
-    "Explore complaint types, resolution times, and closure rates by day and hour — "
-    "powered by a compressed local dataset (.csv.gz)."
-)
-DATA_FILE = "nyc311_12months.csv.gz"  # change if your file is named differently
+PRIMARY = "#4338CA"   # Indigo-ish
+ACCENT  = "#F97316"   # Orange
+GOOD    = "#16A34A"   # Green
+OKAY    = "#0891B2"   # Teal
+BAD     = "#DC2626"   # Red
 
 # -----------------------------
-# Helpers
-# -----------------------------
-def fmt_int(n):
-    try:
-        return f"{int(n):,}"
-    except Exception:
-        return "—"
-
-def safe_col(df: pd.DataFrame, col: str) -> bool:
-    return (df is not None) and (col in df.columns)
-
-def simplify_status(s: pd.Series) -> pd.Series:
-    s = s.fillna("").str.lower()
-    return np.where(s.str.contains("closed"), "Closed", "Open / In Progress")
-
-# -----------------------------
-# Load data (cached)
+# Data loading
 # -----------------------------
 @st.cache_data(show_spinner=True)
-def load_data(path: str) -> pd.DataFrame:
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"Data file '{path}' not found. "
-            f"Upload it to the repo root next to 311.py."
-        )
-    df = pd.read_csv(path, compression="gzip")
-    # Basic typing
-    for c in ["created_date", "closed_date", "resolution_action_updated_date"]:
-        if c in df:
+def load_data():
+    # Try .csv.gz then .csv then sample
+    paths = [
+        ("nyc311_12months.csv.gz", {"compression":"gzip"}),
+        ("nyc311_12months.csv", {}),
+        ("sample.csv", {})
+    ]
+    df = None
+    picked = None
+    for p, kw in paths:
+        if os.path.exists(p):
+            df = pd.read_csv(p, **kw)
+            picked = p
+            break
+    if df is None:
+        raise FileNotFoundError("Could not find nyc311_12months.csv.gz/nyc311_12months.csv/sample.csv in repo.")
+
+    # Normalize important columns
+    for c in ["created_date","closed_date","resolution_action_updated_date"]:
+        if c in df.columns:
             df[c] = pd.to_datetime(df[c], errors="coerce")
-    for c in ["latitude", "longitude"]:
-        if c in df:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    if "hours_to_close" not in df and {"created_date", "closed_date"}.issubset(df.columns):
-        delta = (df["closed_date"] - df["created_date"]).dt.total_seconds() / 3600.0
-        df["hours_to_close"] = delta
-    # essentials for charts
-    if "created_date" in df:
-        df["day_of_week"] = df["created_date"].dt.day_name()
-        df["hour"] = df["created_date"].dt.hour
-        df["year"] = df["created_date"].dt.year
-        df["month"] = df["created_date"].dt.month
-    if "status" in df:
-        df["status_simple"] = simplify_status(df["status"])
-    if "borough" in df:
-        df["borough"] = df["borough"].fillna("Unspecified")
-    if "complaint_type" in df:
-        df["complaint_type"] = df["complaint_type"].fillna("(Unknown)")
-    return df
+
+    # Missing standard columns? create them
+    if "status" not in df.columns:
+        df["status"] = "Unspecified"
+    if "complaint_type" not in df.columns:
+        df["complaint_type"] = "(Unknown)"
+    if "agency_name" not in df.columns:
+        df["agency_name"] = "(Unknown)"
+    if "borough" not in df.columns:
+        df["borough"] = "Unspecified"
+
+    # hours_to_close
+    if "hours_to_close" not in df.columns:
+        if {"created_date","closed_date"}.issubset(df.columns):
+            df["hours_to_close"] = (
+                (df["closed_date"] - df["created_date"])
+                .dt.total_seconds() / 3600.0
+            )
+        else:
+            df["hours_to_close"] = np.nan
+
+    # Add helpers
+    df["day_of_week"] = df["created_date"].dt.day_name()
+    df["hour"]        = df["created_date"].dt.hour
+    # Friendly status bucket
+    df["status_bucket"] = (
+        df["status"].str.lower()
+        .map(lambda s: "Closed" if "closed" in s else ("In Progress" if "progress" in s else ("Open" if "open" in s else s.title())))
+        .fillna("Unspecified")
+    )
+    return df, picked
+
+df, data_file_name = load_data()
 
 # -----------------------------
-# Charts
+# Sidebar filters
 # -----------------------------
-def fig_top_types(df: pd.DataFrame, n: int) -> Tuple[go.Figure, pd.DataFrame]:
-    if df.empty or not safe_col(df, "complaint_type"):
-        return go.Figure(), pd.DataFrame()
-    counts = (
-        df["complaint_type"].value_counts()
-        .head(n)
-        .rename_axis("complaint_type")
-        .reset_index(name="count")
+st.sidebar.header("Filters", divider="grey")
+st.sidebar.success(f"Loaded data from **{data_file_name}**")
+
+days = ["All"] + list(pd.Categorical(df["day_of_week"], 
+                 categories=["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]).dropna().unique())
+day_choice = st.sidebar.selectbox("Day of Week", days, index=0)
+
+hour_min, hour_max = st.sidebar.slider("Hour range (24h)", 0, 23, (0, 23))
+boroughs_all = sorted(df["borough"].dropna().unique().tolist())
+borough_choice = st.sidebar.multiselect("Borough(s)", boroughs_all, default=[])
+top_n = st.sidebar.slider("Top complaint types to show", 5, 30, 20)
+
+# Apply filters
+filtered = df.copy()
+if day_choice != "All":
+    filtered = filtered[filtered["day_of_week"] == day_choice]
+filtered = filtered[(filtered["hour"] >= hour_min) & (filtered["hour"] <= hour_max)]
+if borough_choice:
+    filtered = filtered[filtered["borough"].isin(borough_choice)]
+
+# -----------------------------
+# Header & KPIs
+# -----------------------------
+st.markdown(
+    f"""
+    <h1 style="display:flex;align-items:center;gap:10px;">
+      <span>📞</span>
+      NYC 311 Service Requests Explorer
+    </h1>
+    <p style="color:#6b7280;">
+      Explore complaint types, resolution times, and closure rates by day and hour — powered by a compressed local dataset (<code>.csv.gz</code>).
+    </p>
+    """,
+    unsafe_allow_html=True
+)
+
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Rows (after filters)", f"{len(filtered):,}")
+pct_closed = (filtered["status_bucket"].eq("Closed").mean() * 100) if len(filtered) else 0.0
+k2.metric("% Closed", f"{pct_closed:.1f}%")
+med_hrs = filtered["hours_to_close"].median() if filtered["hours_to_close"].notna().any() else np.nan
+k3.metric("Median Hours to Close", "—" if pd.isna(med_hrs) else f"{med_hrs:.2f}")
+top_type = "—"
+if not filtered.empty:
+    top_counts_local = filtered["complaint_type"].value_counts()
+    if not top_counts_local.empty:
+        top_type = top_counts_local.index[0]
+k4.metric("Top Complaint Type", top_type)
+
+st.divider()
+
+# ======================================================
+# SECTION 1 — Top types bar + status donut + narrative
+# ======================================================
+st.subheader("Top Complaint Types")
+st.caption("What issues are most frequently reported under the current filters?")
+
+counts = (
+    filtered["complaint_type"]
+    .value_counts()
+    .head(top_n)
+    .rename_axis("complaint_type")
+    .reset_index(name="count")
+)
+
+# Safe narrative
+if counts.empty:
+    st.info("No records for the current filters.")
+else:
+    lead_row = counts.iloc[0]
+    lead_type = str(lead_row["complaint_type"])
+    lead_ct   = int(lead_row["count"])
+    st.markdown(
+        f"**Narrative:** **{lead_type}** leads with **{lead_ct:,}** requests. "
+        f"Use the filters (day, hour, borough) to see how the pattern changes."
     )
-    fig = px.bar(
+
+    # Bar
+    fig_bar = px.bar(
         counts,
         x="count",
         y="complaint_type",
         orientation="h",
         color="count",
-        color_continuous_scale="sunset",
-        labels={"count": "Requests (count)", "complaint_type": "Complaint Type"},
-        title=f"Top {n} Complaint Types",
+        color_continuous_scale=px.colors.sequential.Sunset,
+        title=f"Top {min(top_n, len(counts))} Complaint Types",
     )
-    fig.update_layout(
-        yaxis=dict(autorange="reversed"),
-        font=dict(size=14),
-        height=520,
-        coloraxis_showscale=False,
-        margin=dict(t=60, r=10, l=10, b=10),
+    fig_bar.update_layout(
+        height=520, yaxis_title=None, xaxis_title="Requests (count)",
+        coloraxis_showscale=False, margin=dict(l=10,r=10,t=60,b=10),
+        title_x=0.02, title_font_size=20
     )
-    return fig, counts
+    fig_bar.update_yaxes(autorange="reversed")
+    c1, c2 = st.columns([2,1])
+    c1.plotly_chart(fig_bar, use_container_width=True)
 
-
-def fig_status_donut(df: pd.DataFrame) -> go.Figure:
-    if df.empty or not safe_col(df, "status"):
-        return go.Figure()
-    s = df["status"].fillna("Unspecified").value_counts().reset_index()
-    s.columns = ["status", "count"]
-    fig = px.pie(
-        s, values="count", names="status",
-        hole=0.6, color="status",
-        color_discrete_sequence=px.colors.qualitative.Set3,
+    # Status donut
+    status_counts = (
+        filtered["status_bucket"].value_counts()
+        .rename_axis("status")
+        .reset_index(name="count")
+    )
+    fig_donut = px.pie(
+        status_counts, names="status", values="count",
+        hole=0.55, color="status",
+        color_discrete_map={
+            "Closed":GOOD, "In Progress":ACCENT, "Open":PRIMARY, "Unspecified":"#9CA3AF"
+        },
         title="Status Breakdown"
     )
-    fig.update_traces(textposition='inside', textinfo='percent+label')
-    fig.update_layout(font=dict(size=14), height=520, margin=dict(t=60, r=10, l=10, b=10))
-    return fig
+    fig_donut.update_traces(textinfo="percent+label")
+    fig_donut.update_layout(height=520, title_x=0.05, margin=dict(l=10,r=10,t=60,b=10))
+    c2.plotly_chart(fig_donut, use_container_width=True)
 
+st.divider()
 
-def fig_resolution_box(df: pd.DataFrame, top_types: List[str]) -> go.Figure:
-    if df.empty or not safe_col(df, "hours_to_close"):
-        return go.Figure()
-    sub = df.copy()
-    # focus on most common complaint types only (to keep the plot readable)
-    if top_types:
-        sub = sub[sub["complaint_type"].isin(top_types)]
-    sub = sub.dropna(subset=["hours_to_close"])
-    if sub.empty:
-        return go.Figure()
-    # clip extreme values for readability
-    q99 = sub["hours_to_close"].quantile(0.99)
-    sub = sub[sub["hours_to_close"] <= q99]
-    fig = px.box(
-        sub,
-        x="complaint_type",
-        y="hours_to_close",
-        points=False,
-        color="complaint_type",
-        labels={"hours_to_close": "Hours to Close", "complaint_type": "Complaint Type"},
-        title="Resolution Time by Complaint Type (hours, clipped at 99th pct)",
-        color_discrete_sequence=px.colors.qualitative.Bold,
+# ======================================================
+# SECTION 2 — Resolution time by complaint type (box)
+# ======================================================
+st.subheader("Resolution Time by Complaint Type (hours)")
+st.caption("How long do different complaint types take to close? Outliers clipped at 99th percentile for readability.")
+
+if filtered["hours_to_close"].notna().any():
+    temp = filtered[filtered["hours_to_close"].notna()].copy()
+    q99 = temp["hours_to_close"].quantile(0.99)
+    temp = temp[temp["hours_to_close"] <= q99]
+
+    # Keep only top types for clarity
+    top_set = set(counts["complaint_type"]) if not counts.empty else set()
+    if top_set:
+        temp = temp[temp["complaint_type"].isin(top_set)]
+
+    fig_box = px.box(
+        temp, x="complaint_type", y="hours_to_close", points=False,
+        color="complaint_type", color_discrete_sequence=px.colors.qualitative.Set3
     )
-    fig.update_layout(
-        showlegend=False,
-        xaxis_tickangle=-45,
-        font=dict(size=14),
-        height=560,
-        margin=dict(t=60, r=10, l=10, b=80),
+    fig_box.update_layout(
+        height=520, xaxis_title="Complaint Type", yaxis_title="Hours to Close",
+        showlegend=False, margin=dict(l=10,r=10,t=10,b=120)
     )
-    return fig
-
-
-def fig_day_hour_heatmap(df: pd.DataFrame) -> go.Figure:
-    if df.empty or not safe_col(df, "day_of_week") or not safe_col(df, "hour"):
-        return go.Figure()
-    order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-    piv = (
-        df.groupby(["day_of_week", "hour"])
-        .size()
-        .reset_index(name="count")
-        .pivot(index="day_of_week", columns="hour", values="count")
-        .reindex(order)
-        .fillna(0)
-    )
-    # Use imshow for better hover + readable colorbar title
-    fig = px.imshow(
-        piv.values,
-        labels={"x": "Hour of Day (24h)", "y": "Day of Week", "color": "Number of requests"},
-        x=[f"{h:02d}" for h in piv.columns],
-        y=piv.index.tolist(),
-        color_continuous_scale="YlOrRd",
-        title="When are requests made? (Day × Hour)",
-    )
-    fig.update_traces(
-        hovertemplate="Day: %{y}<br>Hour: %{x}:00<br><b>Number of requests</b>: %{z}<extra></extra>"
-    )
-    fig.update_layout(font=dict(size=14), height=560, margin=dict(t=60, r=10, l=10, b=10))
-    return fig
-
-
-def fig_bubbles_hourly(df: pd.DataFrame, max_types: int = 10) -> go.Figure:
-    """
-    Animated bubbles by hour of day.
-    - size: number of requests
-    - color: Closed vs Open / In Progress
-    - group: complaint type (top N overall to keep chart readable)
-    """
-    if df.empty or not safe_col(df, "hour") or not safe_col(df, "complaint_type"):
-        return go.Figure()
-
-    top_types = (
-        df["complaint_type"].value_counts().head(max_types).index.tolist()
-    )
-    sub = df[df["complaint_type"].isin(top_types)].copy()
-    sub["status_simple"] = simplify_status(sub.get("status", pd.Series(index=sub.index)))
-
-    agg = (
-        sub.groupby(["hour", "complaint_type", "status_simple"])
-        .size()
-        .reset_index(name="count")
-    )
-    # Use hour as categorical frame so it animates 0..23
-    agg["hour"] = agg["hour"].astype(int)
-
-    fig = px.scatter(
-        agg,
-        x="complaint_type",
-        y="count",
-        size="count",
-        color="status_simple",
-        animation_frame="hour",
-        size_max=40,
-        color_discrete_map={
-            "Closed": "#2ca02c",
-            "Open / In Progress": "#ff7f0e",
-        },
-        labels={"count": "Requests (count)", "complaint_type": "Complaint Type", "status_simple": "Status"},
-        title="How requests change through the day (play ▶ to animate)",
-    )
-    fig.update_layout(
-        font=dict(size=14),
-        height=560,
-        xaxis_tickangle=-30,
-        margin=dict(t=60, r=10, l=10, b=40),
-    )
-    # nicer hover
-    fig.update_traces(
-        hovertemplate="Hour: %{frame}%{_frame}<br>%{x}<br>Status: %{marker.color}<br><b>Requests</b>: %{y:,}<extra></extra>"
-    )
-    return fig
-
-
-def fig_monthly_trend(df: pd.DataFrame) -> go.Figure:
-    if df.empty or not safe_col(df, "created_date"):
-        return go.Figure()
-    monthly = (
-        df.set_index("created_date")
-        .resample("M")
-        .size()
-        .reset_index(name="count")
-    )
-    monthly["rolling"] = monthly["count"].rolling(3, center=True).mean()
-    fig = go.Figure()
-    fig.add_traces([
-        go.Scatter(
-            x=monthly["created_date"],
-            y=monthly["count"],
-            mode="lines+markers",
-            name="Monthly",
-            line=dict(width=3, color="#1f77b4"),
-        ),
-        go.Scatter(
-            x=monthly["created_date"],
-            y=monthly["rolling"],
-            mode="lines",
-            name="3-month avg",
-            line=dict(width=3, dash="dash", color="#d62728"),
-        ),
-    ])
-    fig.update_layout(
-        title="Monthly 311 Requests — last 12 months",
-        xaxis_title="Month",
-        yaxis_title="Requests (count)",
-        font=dict(size=14),
-        height=460,
-        margin=dict(t=60, r=10, l=10, b=10),
-    )
-    return fig
-
-# -----------------------------
-# UI — Sidebar
-# -----------------------------
-st.sidebar.success(f"Loaded data from **{DATA_FILE}**")
-with st.sidebar:
-    day = st.selectbox("Day of Week", ["All", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"])
-    hr = st.slider("Hour range (24h)", 0, 23, (0, 23))
-    bor = st.multiselect("Borough(s)", [], placeholder="Loading…")
-    top_n = st.slider("Top complaint types to show", 5, 30, 20)
-
-# -----------------------------
-# Load + announce
-# -----------------------------
-df = load_data(DATA_FILE)
-
-# Populate borough choices after loading
-if not bor:
-    with st.sidebar:
-        st.session_state.setdefault("boroughs_loaded", True)
-        bor_default = ["All"]
-        all_bor = sorted(df["borough"].dropna().unique().tolist()) if safe_col(df, "borough") else []
-        bor_sel = st.multiselect("Borough(s)", options=all_bor, default=[], key="bor_select_repl")
-
-st.markdown(f"## 📞 {TITLE}")
-st.caption(SUBTITLE)
-
-# -----------------------------
-# Apply filters
-# -----------------------------
-df_f = df.copy()
-if day != "All" and safe_col(df_f, "day_of_week"):
-    df_f = df_f[df_f["day_of_week"] == day]
-if safe_col(df_f, "hour"):
-    df_f = df_f[(df_f["hour"] >= hr[0]) & (df_f["hour"] <= hr[1])]
-if "bor_select_repl" in st.session_state and st.session_state["bor_select_repl"]:
-    df_f = df_f[df_f["borough"].isin(st.session_state["bor_select_repl"])]
-
-# -----------------------------
-# KPIs + “At a glance”
-# -----------------------------
-colA, colB, colC, colD = st.columns(4)
-with colA:
-    st.metric("Rows (after filters)", fmt_int(len(df_f)))
-closed_pct = df_f["status"].str.lower().str.contains("closed").mean()*100 if safe_col(df_f, "status") and len(df_f)>0 else 0
-with colB:
-    st.metric("% Closed", f"{closed_pct:.1f}%")
-median_hours = df_f["hours_to_close"].median() if safe_col(df_f, "hours_to_close") and len(df_f)>0 else np.nan
-with colC:
-    st.metric("Median Hours to Close", f"{median_hours:.2f}" if pd.notnull(median_hours) else "—")
-top_type = (
-    df_f["complaint_type"].value_counts().idxmax()
-    if safe_col(df_f, "complaint_type") and len(df_f)>0 else "—"
-)
-with colD:
-    st.metric("Top Complaint Type", top_type)
-
-# “At a glance” narrative
-if len(df_f) > 0:
-    # borough share
-    bor_share = (
-        df_f["borough"].value_counts(normalize=True).mul(100).round(1)
-        if safe_col(df_f, "borough") else pd.Series(dtype=float)
-    )
-    slow_med = (
-        df_f.groupby("complaint_type")["hours_to_close"].median().sort_values(ascending=False)
-        if safe_col(df_f, "hours_to_close") and safe_col(df_f, "complaint_type") else pd.Series(dtype=float)
-    )
-    bits = []
-    if safe_col(df_f, "complaint_type"):
-        t = df_f["complaint_type"].value_counts().head(3)
-        if not t.empty:
-            bits.append("Most frequent issues right now are " + ", ".join([f"**{i}** ({fmt_int(v)})" for i, v in t.items()]))
-    if not slow_med.empty:
-        bits.append(
-            f"Slowest to close (median hours) include **{slow_med.index[0]}** ({slow_med.iloc[0]:,.1f}h)"
-        )
-    if not bor_share.empty and len(bor_share) >= 3:
-        top3 = bor_share.head(3)
-        parts = [f"**{i}** {v:.1f}%" for i, v in top3.items()]
-        bits.append("Requests are concentrated in " + ", ".join(parts))
-    if bits:
-        st.markdown("**At a glance:** " + " — ".join(bits) + ".")
-
-st.markdown("---")
-
-# -----------------------------
-# Section 1 — Top complaint types + Status donut
-# -----------------------------
-st.subheader("Top Complaint Types")
-st.caption("What issues are most frequently reported under the current filters?")
-
-fig_bar, counts_df = fig_top_types(df_f, top_n)
-st.plotly_chart(fig_bar, use_container_width=True)
-
-# Narrative for bar (robust to empties)
-if counts_df is not None and not counts_df.empty:
-    lead = counts_df.iloc[0]
-    lead_type = lead.get("complaint_type", "(Unknown)")
-    lead_count = lead.get("count", 0)
-    st.info(
-        f"**Narrative:** **{lead_type}** leads with **{fmt_int(lead_count)}** requests "
-        f"under the current filters."
-    )
+    fig_box.update_xaxes(tickangle=-45)
+    st.plotly_chart(fig_box, use_container_width=True)
 else:
-    st.info("**Narrative:** No complaint types available for the current filters.")
+    st.info("No resolution time data available for current filters.")
 
-# Status donut to the right
-st.subheader("Status Breakdown")
-st.caption("How many are closed vs in progress / open?")
-st.plotly_chart(fig_status_donut(df_f), use_container_width=True)
+st.divider()
 
-st.markdown("---")
+# ======================================================
+# SECTION 3 — Day × Hour Heatmap (with clear colorbar)
+# ======================================================
+st.subheader("When are requests made? (Day × Hour)")
+st.caption("Hover shows **Number of requests**. X-axis uses 24h clock, Y-axis is day of week.")
 
-# -----------------------------
-# Section 2 — Resolution time box + Day × Hour heatmap
-# -----------------------------
-left, right = st.columns(2)
-with left:
-    st.subheader("Resolution Time by Complaint Type (hours)")
-    most_common_types = (
-        df_f["complaint_type"].value_counts().head(15).index.tolist()
-        if safe_col(df_f, "complaint_type") else []
-    )
-    st.plotly_chart(fig_resolution_box(df_f, most_common_types), use_container_width=True)
-    if safe_col(df_f, "hours_to_close"):
-        med_all = df_f["hours_to_close"].median()
-        st.caption(f"**Narrative:** Typical (median) resolution time across filters is **{med_all:,.2f} hours**.")
-
-with right:
-    st.subheader("When are requests made? — Day × Hour")
-    st.plotly_chart(fig_day_hour_heatmap(df_f), use_container_width=True)
-    st.caption("Hover a cell to see the **Number of requests** at that day and hour.")
-
-st.markdown("---")
-
-# -----------------------------
-# Section 3 — Animated bubbles (hourly dynamics)
-# -----------------------------
-st.subheader("How requests evolve during the day (playable)")
-st.caption("Press ▶ to watch requests change by hour. Bubble size = requests; color = Closed vs Open / In Progress.")
-st.plotly_chart(fig_bubbles_hourly(df_f, max_types=12), use_container_width=True)
-
-st.markdown("---")
-
-# -----------------------------
-# Section 4 — Monthly trend
-# -----------------------------
-st.subheader("Monthly trend (last 12 months)")
-st.caption("Overall request volume per month with a 3-month smoothing line for clarity.")
-st.plotly_chart(fig_monthly_trend(df_f), use_container_width=True)
-
-# -----------------------------
-# Footer tip
-# -----------------------------
-st.caption(
-    "Tip: Use the filters on the left to focus by day, hour window, and borough(s). "
-    "All charts update instantly on your compressed local dataset."
+# Build pivot
+heat = (
+    filtered.assign(day=filtered["day_of_week"], hr=filtered["hour"])
+    .groupby(["day","hr"], dropna=False).size().reset_index(name="count")
 )
+
+# order days
+order_days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+heat["day"] = pd.Categorical(heat["day"], categories=order_days, ordered=True)
+heat = heat.sort_values(["day","hr"])
+
+if not heat.empty:
+    fig_heat = px.imshow(
+        heat.pivot(index="day", columns="hr", values="count").fillna(0).values,
+        x=[f"{h:02d}:00" for h in range(24)],
+        y=order_days,
+        color_continuous_scale="YlOrRd",
+        origin="upper",
+        aspect="auto",
+        labels=dict(color="Number of requests")
+    )
+    fig_heat.update_layout(
+        height=520, margin=dict(l=10,r=10,t=10,b=10),
+        coloraxis_colorbar_title="Number of requests",
+    )
+    # Improve hover (build our own grid)
+    z = heat.pivot(index="day", columns="hr", values="count").reindex(order_days).fillna(0).values
+    hover = []
+    for i, d in enumerate(order_days):
+        row = []
+        for h in range(24):
+            row.append(f"Day: {d}<br>Hour: {h:02d}:00<br><b>Number of requests:</b> {int(z[i,h])}")
+        hover.append(row)
+    fig_heat.data[0].hovertemplate = hover
+    st.plotly_chart(fig_heat, use_container_width=True)
+else:
+    st.info("No data to render heatmap for current filters.")
+
+st.divider()
+
+# ======================================================
+# SECTION 4 — Animation 1: Bar race across the day
+# ======================================================
+st.subheader("Animation — How top complaint types evolve through the day")
+st.caption("Press ▶️ to play. Shows **top complaint types by hour** (current filters).")
+
+if not filtered.empty:
+    race_df = (
+        filtered.groupby(["hour","complaint_type"], dropna=False)
+        .size().reset_index(name="count")
+    )
+    # keep only types that appear in top_n across all hours (optional)
+    # to keep it legible, we just limit to the top_n most frequent overall
+    keep = (
+        filtered["complaint_type"].value_counts().head(min(12, top_n)).index
+    )
+    race_df = race_df[race_df["complaint_type"].isin(keep)]
+
+    fig_race = px.bar(
+        race_df, x="count", y="complaint_type",
+        color="complaint_type", orientation="h",
+        animation_frame="hour", range_x=[0, max(1, race_df["count"].max() * 1.1)],
+        color_discrete_sequence=px.colors.qualitative.Bold,
+        title="Top complaint types by hour (24h)"
+    )
+    fig_race.update_layout(
+        height=560, yaxis={"categoryorder":"total ascending"},
+        margin=dict(l=10,r=10,t=60,b=10), title_x=0.02
+    )
+    st.plotly_chart(fig_race, use_container_width=True)
+else:
+    st.info("No data available to animate.")
+
+st.divider()
+
+# ======================================================
+# SECTION 5 — Animation 2: Bubble animation
+# count vs median hours, by complaint type, across the day
+# ======================================================
+st.subheader("Animation — Workload vs speed (bubble)")
+st.caption("Press ▶️ to play. Each bubble is a complaint type. X = number of requests, Y = median hours to close, bubble size = request volume; frame = hour.")
+
+if filtered["hours_to_close"].notna().any():
+    agg = (
+        filtered.groupby(["hour","complaint_type"], dropna=False)
+        .agg(count=("complaint_type","size"),
+             med_hours=("hours_to_close","median"))
+        .reset_index()
+    )
+    # keep most frequent types overall
+    keep2 = filtered["complaint_type"].value_counts().head(min(12, top_n)).index
+    agg = agg[agg["complaint_type"].isin(keep2)]
+
+    fig_bubble = px.scatter(
+        agg, x="count", y="med_hours",
+        size="count", color="complaint_type",
+        animation_frame="hour", size_max=50,
+        color_discrete_sequence=px.colors.qualitative.Set2,
+        labels={"count":"Requests (count)","med_hours":"Median hours to close"},
+        title="Volume vs. Resolution Speed by Hour"
+    )
+    fig_bubble.update_layout(height=560, margin=dict(l=10,r=10,t=60,b=10), title_x=0.02)
+    st.plotly_chart(fig_bubble, use_container_width=True)
+else:
+    st.info("Not enough resolution-time data to build the bubble animation.")
+
+st.divider()
+
+# ======================================================
+# SECTION 6 — Fancy Map (Folium) with clustering + heat
+# ======================================================
+st.subheader("Geographic View — Where are the complaints?")
+st.caption("Interactive map with **clustered points** (colored by status) and a **heat layer**. Hover popups show **type, status, borough, time**. For performance we sample up to 25k points.")
+
+has_geo = {"latitude","longitude"}.issubset(filtered.columns)
+if has_geo and filtered[["latitude","longitude"]].dropna().shape[0] > 0:
+    # Sample to keep the map snappy
+    map_df = filtered.dropna(subset=["latitude","longitude"]).copy()
+    if len(map_df) > 25000:
+        map_df = map_df.sample(25000, random_state=42)
+
+    # Center on NYC approx
+    center = [40.7128, -74.0060]
+    m = folium.Map(location=center, zoom_start=10, tiles="cartodbpositron")
+
+    # Heat layer (recent density)
+    heat_data = map_df[["latitude","longitude"]].values.tolist()
+    if len(heat_data) > 0:
+        HeatMap(heat_data, radius=10, blur=15, min_opacity=0.3).add_to(m)
+
+    # Clustered markers, colored by status
+    cluster = MarkerCluster().add_to(m)
+
+    def status_color(s: str) -> str:
+        s = (s or "").lower()
+        if "closed" in s:
+            return "green"
+        if "progress" in s:
+            return "orange"
+        if "open" in s:
+            return "blue"
+        return "gray"
+
+    for _, row in map_df.iterrows():
+        lat = row["latitude"]; lon = row["longitude"]
+        if pd.isna(lat) or pd.isna(lon):
+            continue
+        ctype = str(row.get("complaint_type","(Unknown)"))
+        stat  = str(row.get("status","Unspecified"))
+        boro  = str(row.get("borough","Unspecified"))
+        ts    = row.get("created_date")
+        ts_txt = ts.strftime("%Y-%m-%d %H:%M") if pd.notna(ts) else ""
+        popup = folium.Popup(
+            folium.IFrame(
+                html=f"<b>{ctype}</b><br>Status: {stat}<br>Borough: {boro}<br>Created: {ts_txt}",
+                width=260, height=110
+            ),
+            max_width=260
+        )
+        folium.CircleMarker(
+            location=[lat, lon],
+            radius=4,
+            color=status_color(stat),
+            fill=True, fill_opacity=0.7,
+            popup=popup
+        ).add_to(cluster)
+
+    st_folium(m, height=580, width=None)
+else:
+    st.info("No latitude/longitude available for the current filters to render the map.")
+
+# ======================================================
+# FOOTER TIP
+# ======================================================
+st.caption("Tip: Use filters (left) to focus the story by day, hour window, and borough(s). Charts and animations update instantly on your compressed local dataset.")
+
 
 
