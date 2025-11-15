@@ -4,7 +4,7 @@ import numpy as np
 import plotly.express as px
 from streamlit_folium import st_folium
 import folium
-from folium.plugins import MarkerCluster
+from folium.plugins import MarkerCluster, Fullscreen
 
 # -------------------------------
 # Page setup
@@ -185,7 +185,6 @@ if rows_after and "status" in df_f:
             f"Overall closure rate is **{pct_closed:.1f}%**."
         )
 
-        # Ensure unique, proper column names for Plotly’s new backend
         status_counts = pd.DataFrame(status_counts.loc[:, ["Status", "Count"]])
 
         fig_pie = px.pie(
@@ -285,9 +284,6 @@ if rows_after and {"day_of_week","hour"}.issubset(df_f.columns):
 # --------------------------------
 # ANIMATED BAR (keep the warm colors) + narrative
 # --------------------------------
-# --------------------------------
-# ANIMATED BAR (keep the warm colors) + narrative
-# --------------------------------
 st.subheader("▶️ How do complaints evolve through the day?")
 st.caption("Press **Play** to watch requests change by hour (top categories shown for clarity).")
 
@@ -320,7 +316,7 @@ if rows_after and {"hour", "complaint_type"}.issubset(df_f.columns):
         orientation="h",
         range_x=[0, max(1, int(df_anim["Requests"].max() * 1.15))],
         color_discrete_sequence=WARM,
-        category_orders={"hour": list(range(24))},  # Force 0→23
+        category_orders={"hour": list(range(24))},
         title="How requests evolve through the day (press ▶ to play)",
     )
     fig_anim.update_layout(
@@ -339,17 +335,15 @@ if rows_after and {"hour", "complaint_type"}.issubset(df_f.columns):
             f"**Narrative:** Within the shown categories, peaks typically occur around **{int(by_hour.index[0])}:00**."
         )
 
-
-
 # --------------------------------
-# GEOGRAPHIC MAP with legend + tooltips/popups
+# GEOGRAPHIC MAP with legend + tooltips/popups (optimized)
 # --------------------------------
 st.subheader("🗺️ Complaint Hotspots Across NYC")
-st.caption("Map shows sampled complaints. Dot color = status (legend below). Click a dot for details.")
+st.caption("Map shows sampled complaints. Dot color = status (see legend). Click or hover for details.")
 
 if rows_after and {"latitude","longitude"}.issubset(df_f.columns):
-    # Sample to keep performance snappy
-    sample_n = min(1500, len(df_f))
+    # Smaller sample for speed + smoother zoom
+    sample_n = min(800, len(df_f))
     df_map = df_f.dropna(subset=["latitude","longitude"]).sample(sample_n, random_state=42)
 
     # Simple status→color legend
@@ -365,9 +359,19 @@ if rows_after and {"latitude","longitude"}.issubset(df_f.columns):
     def pick_color(s):
         return status_colors.get(s, "#9E9E9E")
 
-    # Build map
-    m = folium.Map(location=[40.7128, -74.0060], zoom_start=11, tiles="cartodbpositron")
-    cluster = MarkerCluster().add_to(m)
+    # Build map (prefer_canvas for better performance)
+    m = folium.Map(
+        location=[40.7128, -74.0060],
+        zoom_start=11,
+        tiles="cartodbpositron",
+        prefer_canvas=True
+    )
+
+    # Fullscreen button
+    Fullscreen(position="topleft").add_to(m)
+
+    # Cluster with less work at very high zoom
+    cluster = MarkerCluster(disableClusteringAtZoom=15).add_to(m)
 
     for _, r in df_map.iterrows():
         status = r.get("status", "Unspecified")
@@ -396,8 +400,13 @@ if rows_after and {"latitude","longitude"}.issubset(df_f.columns):
         )
         folium.CircleMarker(
             location=[r["latitude"], r["longitude"]],
-            radius=4, color=color, fill=True, fill_color=color, fill_opacity=0.75,
-            tooltip=tooltip, popup=popup_html
+            radius=4,
+            color=color,
+            fill=True,
+            fill_color=color,
+            fill_opacity=0.75,
+            tooltip=tooltip,
+            popup=popup_html
         ).add_to(cluster)
 
     # Add HTML legend
@@ -421,14 +430,11 @@ if rows_after and {"latitude","longitude"}.issubset(df_f.columns):
     </div>
     """
     m.get_root().html.add_child(folium.Element(legend_html))
-    st_folium(m, width=1200, height=600)
+
+    # Bigger map, full width
+    st_folium(m, use_container_width=True, height=700)
 else:
     st.info("No latitude/longitude columns in the dataset (or no rows after filters).")
 
 st.markdown("---")
 st.caption("Tip: If the runner icon stays spinning for long, try narrowing filters or lowering chart item counts.")
-
-
-
-
-
